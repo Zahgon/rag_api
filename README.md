@@ -1,7 +1,7 @@
-﻿# ID-based RAG FastAPI
+﻿# ID-based RAG Flask
 
 ## Overview
-This project integrates Langchain with FastAPI in an Asynchronous, Scalable manner, providing a framework for document indexing and retrieval, using PostgreSQL/pgvector.
+This project integrates Langchain with Flask in an Asynchronous, Scalable manner, providing a framework for document indexing and retrieval, using PostgreSQL/pgvector.
 
 Files are organized into embeddings by `file_id`. The primary use case is for integration with [LibreChat](https://librechat.ai), but this simple API can be used for any ID-based use case.
 
@@ -120,7 +120,7 @@ this release.
     - Run the following commands (preferably in a [virtual environment](https://realpython.com/python-virtual-environments-a-primer/))
 ```bash
 pip install -r requirements.txt
-uvicorn main:app
+python main.py
 ```
 
 ### Clean Install (Local Development)

@@ -12,17 +12,9 @@ import time
 from shutil import copyfileobj
 from typing import List, Iterable, Optional, Union, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import (
-    APIRouter,
-    Request,
-    UploadFile,
-    HTTPException,
-    File,
-    Form,
-    Body,
-    Query,
-    status,
-)
+from http import HTTPStatus
+from flask import Blueprint, current_app, g, jsonify
+from werkzeug.datastructures import FileStorage
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
@@ -45,7 +37,18 @@ from app.config import (
     PARALLEL_EXECUTION,
     RAG_DISTANCE_THRESHOLD,
 )
+from app.async_runner import async_route
+from app.errors import APIError
 from app.scope import file_clause, files_clause, resolve_scope
+from app.validation import (
+    STRING_LIST,
+    form_field,
+    json_body,
+    json_body_as,
+    query_param,
+    required_multipart,
+    required_query_list,
+)
 
 # Warn once at import time if the user set a threshold under Atlas, where
 # the score direction is inverted (Atlas vectorSearchScore: higher = better)
@@ -99,7 +102,7 @@ from app.utils.document_loader import (
 )
 from app.utils.health import is_health_ok
 
-router = APIRouter()
+bp = Blueprint("documents", __name__)
 
 _INGESTION_ATTEMPT_ID_KEY = "_rag_ingestion_attempt_id"
 _INGESTION_ATTEMPT_STARTED_AT_NS_KEY = "_rag_ingestion_attempt_started_at_ns"
@@ -190,12 +193,13 @@ def calculate_num_batches(total: int, batch_size: int) -> int:
     return (total + batch_size - 1) // batch_size
 
 
-def get_user_id(request: Request, entity_id: str = None) -> str:
+def get_user_id(entity_id: str = None) -> str:
     """Extract user ID from request or entity_id."""
-    if not hasattr(request.state, "user"):
+    user = g.get("user")
+    if user is None:
         return entity_id if entity_id else "public"
     else:
-        return entity_id if entity_id else request.state.user.get("id")
+        return entity_id if entity_id else user.get("id")
 
 
 def get_process_memory_details() -> str:
@@ -269,31 +273,11 @@ def build_ingestion_context(
     return " | ".join(parts)
 
 
-async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
-    """Save uploaded file asynchronously."""
-    try:
-        async with aiofiles.open(temp_file_path, "wb") as temp_file:
-            chunk_size = 64 * 1024  # 64 KB
-            while content := await file.read(chunk_size):
-                await temp_file.write(content)
-    except Exception as e:
-        logger.error(
-            "Failed to save uploaded file | Path: %s | Error: %s | Traceback: %s",
-            temp_file_path,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save the uploaded file. Error: {str(e)}",
-        )
-
-
-def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
+def save_upload_file_sync(file: FileStorage, temp_file_path: str) -> None:
     """Save uploaded file synchronously."""
     try:
         with open(temp_file_path, "wb") as temp_file:
-            copyfileobj(file.file, temp_file)
+            copyfileobj(file.stream, temp_file)
     except Exception as e:
         logger.error(
             "Failed to save uploaded file | Path: %s | Error: %s | Traceback: %s",
@@ -301,10 +285,24 @@ def save_upload_file_sync(file: UploadFile, temp_file_path: str) -> None:
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        raise APIError(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"Failed to save the uploaded file. Error: {str(e)}",
         )
+
+
+async def save_upload_file_async(
+    file: FileStorage, temp_file_path: str, executor=None
+) -> None:
+    """Save uploaded file without blocking the event loop.
+
+    The upload stream is a spooled temp file: once it has grown past the spool
+    threshold, reading it is disk I/O. Every request in the process shares one
+    event loop, so that read is handed to the executor rather than performed on
+    the loop itself.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(executor, save_upload_file_sync, file, temp_file_path)
 
 
 def validate_file_path(base_dir: str, file_path: str) -> Optional[str]:
@@ -390,63 +388,82 @@ async def cleanup_temp_file_async(file_path: str) -> None:
         )
 
 
-@router.get("/ids")
-async def get_all_ids(request: Request, entity_id: str = None):
-    scope = resolve_scope(request, entity_id)
+def _serialize_documents(documents: Iterable[Document]) -> list:
+    """Render documents the way the ``list[DocumentResponse]`` model did."""
+    return [
+        DocumentResponse(
+            page_content=document.page_content, metadata=document.metadata
+        ).model_dump()
+        for document in documents
+    ]
+
+
+def _serialize_scored_documents(documents: Iterable[tuple]) -> list:
+    """Render ``(document, score)`` pairs as the two-element arrays clients read."""
+    return [[document.model_dump(), score] for document, score in documents]
+
+
+@bp.get("/ids")
+@async_route
+async def get_all_ids():
+    scope = resolve_scope(query_param("entity_id"))
     try:
         if isinstance(vector_store, AsyncPgVector):
             ids = await vector_store.get_all_ids(
-                owners=scope.owners, executor=request.app.state.thread_pool
+                owners=scope.owners, executor=current_app.extensions["thread_pool"]
             )
         else:
             ids = vector_store.get_all_ids(owners=scope.owners)
 
-        return list(set(ids))
-    except HTTPException as http_exc:
+        return jsonify(list(set(ids)))
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in get_all_ids | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Failed to get all IDs | Error: %s | Traceback: %s",
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise APIError(status_code=500, detail=str(e))
 
 
-@router.get("/health")
+@bp.get("/health")
+@async_route
 async def health_check():
+    # The (body, status) pairs below have always been sent as a two-element JSON
+    # array with status 200; clients read the state from the body.
     try:
         if await is_health_ok():
-            return {"status": "UP"}
+            return jsonify({"status": "UP"})
         else:
             logger.error("Health check failed")
-            return {"status": "DOWN"}, 503
+            return jsonify([{"status": "DOWN"}, 503])
     except Exception as e:
         logger.error(
             "Error during health check | Error: %s | Traceback: %s",
             str(e),
             traceback.format_exc(),
         )
-        return {"status": "DOWN", "error": str(e)}, 503
+        return jsonify([{"status": "DOWN", "error": str(e)}, 503])
 
 
-@router.get("/documents", response_model=list[DocumentResponse])
-async def get_documents_by_ids(
-    request: Request, ids: list[str] = Query(...), entity_id: str = None
-):
-    scope = resolve_scope(request, entity_id)
+@bp.get("/documents")
+@async_route
+async def get_documents_by_ids():
+    ids = required_query_list("ids")
+    scope = resolve_scope(query_param("entity_id"))
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
-                ids, owners=scope.owners, executor=request.app.state.thread_pool
+                ids, owners=scope.owners, executor=current_app.extensions["thread_pool"]
             )
             documents = await vector_store.get_documents_by_ids(
-                ids, owners=scope.owners, executor=request.app.state.thread_pool
+                ids, owners=scope.owners, executor=current_app.extensions["thread_pool"]
             )
         else:
             existing_ids = vector_store.get_filtered_ids(ids, owners=scope.owners)
@@ -455,22 +472,22 @@ async def get_documents_by_ids(
         # A file outside the caller's scope reads as absent rather than refused,
         # so this route is not an existence oracle over the deployment.
         if not all(id in existing_ids for id in ids):
-            raise HTTPException(status_code=404, detail="One or more IDs not found")
+            raise APIError(status_code=404, detail="One or more IDs not found")
 
         # Ensure documents list is not empty
         if not documents:
-            raise HTTPException(
+            raise APIError(
                 status_code=404, detail="No documents found for the given IDs"
             )
 
-        return documents
-    except HTTPException as http_exc:
+        return jsonify(_serialize_documents(documents))
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in get_documents_by_ids | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error getting documents by IDs | IDs: %s | Error: %s | Traceback: %s",
@@ -478,14 +495,14 @@ async def get_documents_by_ids(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise APIError(status_code=500, detail=str(e))
 
 
-@router.delete("/documents")
-async def delete_documents(
-    request: Request, document_ids: List[str] = Body(...), entity_id: str = None
-):
-    scope = resolve_scope(request, entity_id)
+@bp.delete("/documents")
+@async_route
+async def delete_documents():
+    document_ids = json_body_as(STRING_LIST)
+    scope = resolve_scope(query_param("entity_id"))
     try:
         # Resolve existence within the caller's scope *before* deleting anything.
         # A request mixing owned and unknown ids would otherwise destroy the owned
@@ -494,7 +511,7 @@ async def delete_documents(
             existing_ids = await vector_store.get_filtered_ids(
                 document_ids,
                 owners=scope.owners,
-                executor=request.app.state.thread_pool,
+                executor=current_app.extensions["thread_pool"],
             )
         else:
             existing_ids = vector_store.get_filtered_ids(
@@ -502,28 +519,30 @@ async def delete_documents(
             )
 
         if not all(id in existing_ids for id in document_ids):
-            raise HTTPException(status_code=404, detail="One or more IDs not found")
+            raise APIError(status_code=404, detail="One or more IDs not found")
 
         if isinstance(vector_store, AsyncPgVector):
             await vector_store.delete_scoped(
                 ids=document_ids,
                 owners=scope.owners,
-                executor=request.app.state.thread_pool,
+                executor=current_app.extensions["thread_pool"],
             )
         else:
             vector_store.delete_scoped(ids=document_ids, owners=scope.owners)
 
         file_count = len(document_ids)
-        return {
-            "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
-        }
-    except HTTPException as http_exc:
+        return jsonify(
+            {
+                "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
+            }
+        )
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in delete_documents | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Failed to delete documents | IDs: %s | Error: %s | Traceback: %s",
@@ -531,7 +550,7 @@ async def delete_documents(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise APIError(status_code=500, detail=str(e))
 
 
 # Cache the embedding function with LRU cache
@@ -540,12 +559,11 @@ def get_cached_query_embedding(query: str):
     return vector_store.embedding_function.embed_query(query)
 
 
-@router.post("/query")
-async def query_embeddings_by_file_id(
-    body: QueryRequestBody,
-    request: Request,
-):
-    scope = resolve_scope(request, body.entity_id)
+@bp.post("/query")
+@async_route
+async def query_embeddings_by_file_id():
+    body = json_body(QueryRequestBody)
+    scope = resolve_scope(body.entity_id)
 
     try:
         embedding = get_cached_query_embedding(body.query)
@@ -556,22 +574,24 @@ async def query_embeddings_by_file_id(
                 embedding,
                 k=body.k,
                 filter=query_filter,
-                executor=request.app.state.thread_pool,
+                executor=current_app.extensions["thread_pool"],
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
                 embedding, k=body.k, filter=query_filter
             )
 
-        return _apply_distance_threshold(documents)
+        return jsonify(
+            _serialize_scored_documents(_apply_distance_threshold(documents))
+        )
 
-    except HTTPException as http_exc:
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in query_embeddings_by_file_id | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error in query embeddings | File ID: %s | Query: %s | Error: %s | Traceback: %s",
@@ -580,7 +600,7 @@ async def query_embeddings_by_file_id(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise APIError(status_code=500, detail=str(e))
 
 
 async def _process_documents_async_pipeline(
@@ -1085,11 +1105,11 @@ async def store_data_in_vector_db(
         return {"message": "An error occurred while adding documents.", "error": str(e)}
 
 
-@router.post("/local/embed")
-async def embed_local_file(
-    document: StoreDocument, request: Request, entity_id: str = None
-):
-    user_id = get_user_id(request, entity_id)
+@bp.post("/local/embed")
+@async_route
+async def embed_local_file():
+    document = json_body(StoreDocument)
+    user_id = get_user_id(query_param("entity_id"))
     file_path = validate_file_path(RAG_UPLOAD_DIR, document.filepath)
 
     # Check if the file exists and if it is within the allowed upload directory
@@ -1101,8 +1121,8 @@ async def embed_local_file(
             document.filename,
             document.filepath,
         )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+        raise APIError(
+            status_code=HTTPStatus.NOT_FOUND,
             detail=ERROR_MESSAGES.FILE_NOT_FOUND,
         )
 
@@ -1124,7 +1144,7 @@ async def embed_local_file(
         )
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(
-            request.app.state.thread_pool, lambda: list(loader.lazy_load())
+            current_app.extensions["thread_pool"], lambda: list(loader.lazy_load())
         )
 
         result = await store_data_in_vector_db(
@@ -1132,7 +1152,7 @@ async def embed_local_file(
             document.file_id,
             user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=current_app.extensions["thread_pool"],
             route_name="local_embed",
             filename=document.filename,
             content_type=document.file_content_type,
@@ -1140,27 +1160,29 @@ async def embed_local_file(
         )
 
         if result:
-            return {
-                "status": True,
-                "file_id": document.file_id,
-                "filename": document.filename,
-                "known_type": known_type,
-            }
+            return jsonify(
+                {
+                    "status": True,
+                    "file_id": document.file_id,
+                    "filename": document.filename,
+                    "known_type": known_type,
+                }
+            )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            raise APIError(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
-    except HTTPException as http_exc:
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in embed_local_file | route=local_embed | user_id=%s | file_id=%s | filename=%s | status=%d | detail=%s",
             user_id,
             document.file_id,
             document.filename,
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Unhandled exception in embed_local_file | route=local_embed | user_id=%s | file_id=%s | filename=%s | error=%s | traceback=%s",
@@ -1171,13 +1193,13 @@ async def embed_local_file(
             traceback.format_exc(),
         )
         if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+            raise APIError(
+                status_code=HTTPStatus.BAD_REQUEST,
                 detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+            raise APIError(
+                status_code=HTTPStatus.BAD_REQUEST,
                 detail=ERROR_MESSAGES.DEFAULT(e),
             )
     finally:
@@ -1186,18 +1208,17 @@ async def embed_local_file(
             cleanup_temp_encoding_file(loader)
 
 
-@router.post("/embed")
-async def embed_file(
-    request: Request,
-    file_id: str = Form(...),
-    file: UploadFile = File(...),
-    entity_id: str = Form(None),
-):
+@bp.post("/embed")
+@async_route
+async def embed_file():
+    file_id, file = required_multipart(("form", "file_id"), ("file", "file"))
+    entity_id = form_field("entity_id")
+
     response_status = True
     response_message = "File processed successfully."
     known_type = None
 
-    user_id = get_user_id(request, entity_id)
+    user_id = get_user_id(entity_id)
     validated_file_path = _make_unique_temp_path(user_id, file.filename)
 
     if validated_file_path is None:
@@ -1207,8 +1228,8 @@ async def embed_file(
             file_id,
             file.filename,
         )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
@@ -1225,12 +1246,14 @@ async def embed_file(
             ),
         )
         os.makedirs(os.path.dirname(validated_file_path), exist_ok=True)
-        await save_upload_file_async(file, validated_file_path)
+        await save_upload_file_async(
+            file, validated_file_path, current_app.extensions["thread_pool"]
+        )
         data, known_type, file_ext = await load_file_content(
             file.filename,
             file.content_type,
             validated_file_path,
-            request.app.state.thread_pool,
+            current_app.extensions["thread_pool"],
         )
 
         logger.debug(
@@ -1246,7 +1269,7 @@ async def embed_file(
             file_id=file_id,
             user_id=user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=current_app.extensions["thread_pool"],
             route_name="embed",
             filename=file.filename,
             content_type=file.content_type,
@@ -1256,8 +1279,8 @@ async def embed_file(
         if not result:
             response_status = False
             response_message = "Failed to process/store the file data."
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            raise APIError(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
         elif "error" in result:
@@ -1266,22 +1289,22 @@ async def embed_file(
             if isinstance(result["error"], str):
                 response_message = result["error"]
             else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                raise APIError(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                     detail="An unspecified error occurred.",
                 )
-    except HTTPException as http_exc:
+    except APIError as api_error:
         response_status = False
-        response_message = f"HTTP Exception: {http_exc.detail}"
+        response_message = f"HTTP Exception: {api_error.detail}"
         logger.error(
             "HTTP Exception in embed_file | route=embed | user_id=%s | file_id=%s | filename=%s | status=%d | detail=%s",
             user_id,
             file_id,
             file.filename,
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         response_status = False
         response_message = f"Error during file processing: {str(e)}"
@@ -1293,33 +1316,36 @@ async def embed_file(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=f"Error during file processing: {str(e)}",
         )
     finally:
         await cleanup_temp_file_async(validated_file_path)
 
-    return {
-        "status": response_status,
-        "message": response_message,
-        "file_id": file_id,
-        "filename": file.filename,
-        "known_type": known_type,
-    }
+    return jsonify(
+        {
+            "status": response_status,
+            "message": response_message,
+            "file_id": file_id,
+            "filename": file.filename,
+            "known_type": known_type,
+        }
+    )
 
 
-@router.get("/documents/{id}/context")
-async def load_document_context(request: Request, id: str, entity_id: str = None):
+@bp.get("/documents/<id>/context")
+@async_route
+async def load_document_context(id: str):
     ids = [id]
-    scope = resolve_scope(request, entity_id)
+    scope = resolve_scope(query_param("entity_id"))
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
-                ids, owners=scope.owners, executor=request.app.state.thread_pool
+                ids, owners=scope.owners, executor=current_app.extensions["thread_pool"]
             )
             documents = await vector_store.get_documents_by_ids(
-                ids, owners=scope.owners, executor=request.app.state.thread_pool
+                ids, owners=scope.owners, executor=current_app.extensions["thread_pool"]
             )
         else:
             existing_ids = vector_store.get_filtered_ids(ids, owners=scope.owners)
@@ -1328,24 +1354,22 @@ async def load_document_context(request: Request, id: str, entity_id: str = None
         # A file outside the caller's scope reads as absent rather than refused,
         # so this route is not an existence oracle over the deployment.
         if not all(id in existing_ids for id in ids):
-            raise HTTPException(
+            raise APIError(
                 status_code=404, detail="The specified file_id was not found"
             )
 
         # Ensure documents list is not empty
         if not documents:
-            raise HTTPException(
-                status_code=404, detail="No document found for the given ID"
-            )
+            raise APIError(status_code=404, detail="No document found for the given ID")
 
-        return process_documents(_order_documents_by_chunk_index(documents))
-    except HTTPException as http_exc:
+        return jsonify(process_documents(_order_documents_by_chunk_index(documents)))
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in load_document_context | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error loading document context | Document ID: %s | Error: %s | Traceback: %s",
@@ -1353,20 +1377,21 @@ async def load_document_context(request: Request, id: str, entity_id: str = None
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT(e),
         )
 
 
-@router.post("/embed-upload")
-async def embed_file_upload(
-    request: Request,
-    file_id: str = Form(...),
-    uploaded_file: UploadFile = File(...),
-    entity_id: str = Form(None),
-):
-    user_id = get_user_id(request, entity_id)
+@bp.post("/embed-upload")
+@async_route
+async def embed_file_upload():
+    file_id, uploaded_file = required_multipart(
+        ("form", "file_id"), ("file", "uploaded_file")
+    )
+    entity_id = form_field("entity_id")
+
+    user_id = get_user_id(entity_id)
 
     validated_temp_file_path = _make_unique_temp_path(user_id, uploaded_file.filename)
 
@@ -1377,8 +1402,8 @@ async def embed_file_upload(
             file_id,
             uploaded_file.filename,
         )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
@@ -1395,12 +1420,16 @@ async def embed_file_upload(
             ),
         )
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
-        await save_upload_file_async(uploaded_file, validated_temp_file_path)
+        await save_upload_file_async(
+            uploaded_file,
+            validated_temp_file_path,
+            current_app.extensions["thread_pool"],
+        )
         data, known_type, file_ext = await load_file_content(
             uploaded_file.filename,
             uploaded_file.content_type,
             validated_temp_file_path,
-            request.app.state.thread_pool,
+            current_app.extensions["thread_pool"],
         )
 
         result = await store_data_in_vector_db(
@@ -1408,7 +1437,7 @@ async def embed_file_upload(
             file_id,
             user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=current_app.extensions["thread_pool"],
             route_name="embed_upload",
             filename=uploaded_file.filename,
             content_type=uploaded_file.content_type,
@@ -1416,20 +1445,20 @@ async def embed_file_upload(
         )
 
         if not result:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            raise APIError(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
-    except HTTPException as http_exc:
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in embed_file_upload | route=embed_upload | user_id=%s | file_id=%s | filename=%s | status=%d | detail=%s",
             user_id,
             file_id,
             uploaded_file.filename,
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error during file processing | route=embed_upload | user_id=%s | file_id=%s | filename=%s | error=%s | traceback=%s",
@@ -1439,25 +1468,29 @@ async def embed_file_upload(
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=f"Error during file processing: {str(e)}",
         )
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
 
-    return {
-        "status": True,
-        "message": "File processed successfully.",
-        "file_id": file_id,
-        "filename": uploaded_file.filename,
-        "known_type": known_type,
-    }
+    return jsonify(
+        {
+            "status": True,
+            "message": "File processed successfully.",
+            "file_id": file_id,
+            "filename": uploaded_file.filename,
+            "known_type": known_type,
+        }
+    )
 
 
-@router.post("/query_multiple")
-async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
-    scope = resolve_scope(request, body.entity_id)
+@bp.post("/query_multiple")
+@async_route
+async def query_embeddings_by_file_ids():
+    body = json_body(QueryMultipleBody)
+    scope = resolve_scope(body.entity_id)
     try:
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
@@ -1469,7 +1502,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
                 embedding,
                 k=body.k,
                 filter=query_filter,
-                executor=request.app.state.thread_pool,
+                executor=current_app.extensions["thread_pool"],
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
@@ -1480,18 +1513,18 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
 
         # Ensure documents list is not empty
         if not documents:
-            raise HTTPException(
+            raise APIError(
                 status_code=404, detail="No documents found for the given query"
             )
 
-        return documents
-    except HTTPException as http_exc:
+        return jsonify(_serialize_scored_documents(documents))
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in query_embeddings_by_file_ids | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error in query multiple embeddings | File IDs: %s | Query: %s | Error: %s | Traceback: %s",
@@ -1500,58 +1533,61 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             str(e),
             traceback.format_exc(),
         )
-        raise HTTPException(status_code=500, detail=str(e))
+        raise APIError(status_code=500, detail=str(e))
 
 
-@router.post("/text")
-async def extract_text_from_file(
-    request: Request,
-    file_id: str = Form(...),
-    file: UploadFile = File(...),
-    entity_id: str = Form(None),
-):
+@bp.post("/text")
+@async_route
+async def extract_text_from_file():
     """
     Extract text content from an uploaded file without creating embeddings.
     Returns the raw text content for text parsing purposes.
     """
-    user_id = get_user_id(request, entity_id)
+    file_id, file = required_multipart(("form", "file_id"), ("file", "file"))
+    entity_id = form_field("entity_id")
+
+    user_id = get_user_id(entity_id)
     validated_temp_file_path = _make_unique_temp_path(user_id, file.filename)
 
     if validated_temp_file_path is None:
         logger.warning("Path validation failed for text extraction: %s", file.filename)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+        raise APIError(
+            status_code=HTTPStatus.BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Invalid request"),
         )
 
     try:
         os.makedirs(os.path.dirname(validated_temp_file_path), exist_ok=True)
-        await save_upload_file_async(file, validated_temp_file_path)
+        await save_upload_file_async(
+            file, validated_temp_file_path, current_app.extensions["thread_pool"]
+        )
         data, known_type, file_ext = await load_file_content(
             file.filename,
             file.content_type,
             validated_temp_file_path,
-            request.app.state.thread_pool,
+            current_app.extensions["thread_pool"],
             raw_text=True,
         )
 
         # Extract text content from loaded documents
         text_content = extract_text_from_documents(data, file_ext)
 
-        return {
-            "text": text_content,
-            "file_id": file_id,
-            "filename": file.filename,
-            "known_type": known_type,
-        }
+        return jsonify(
+            {
+                "text": text_content,
+                "file_id": file_id,
+                "filename": file.filename,
+                "known_type": known_type,
+            }
+        )
 
-    except HTTPException as http_exc:
+    except APIError as api_error:
         logger.error(
             "HTTP Exception in extract_text_from_file | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
+            api_error.status_code,
+            api_error.detail,
         )
-        raise http_exc
+        raise api_error
     except Exception as e:
         logger.error(
             "Error during text extraction | File: %s | Error: %s | Traceback: %s",
@@ -1560,13 +1596,13 @@ async def extract_text_from_file(
             traceback.format_exc(),
         )
         if "No pandoc was found" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+            raise APIError(
+                status_code=HTTPStatus.BAD_REQUEST,
                 detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+            raise APIError(
+                status_code=HTTPStatus.BAD_REQUEST,
                 detail=f"Error during text extraction: {str(e)}",
             )
     finally:

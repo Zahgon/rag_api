@@ -12,7 +12,6 @@ import os
 
 import jwt
 import pytest
-from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 
 from app.routes import document_routes
@@ -28,7 +27,7 @@ VICTIM_FILE = "file-victim"
 ATTACKER_FILE = "file-attacker"
 AGENT_FILE = "file-agent"
 
-client = TestClient(app)
+client = app.test_client()
 
 
 def _token(user_id: str) -> dict:
@@ -102,11 +101,6 @@ def store_double(monkeypatch):
         document_routes, "get_cached_query_embedding", lambda query: [0.1, 0.2, 0.3]
     )
 
-    if getattr(app.state, "thread_pool", None) is None:
-        from concurrent.futures import ThreadPoolExecutor
-
-        app.state.thread_pool = ThreadPoolExecutor(max_workers=2)
-
     deleted = []
 
     async def get_all_ids(self, owners, executor=None):
@@ -167,9 +161,9 @@ def test_ids_lists_only_the_callers_files(attacker_headers):
     response = client.get("/ids", headers=attacker_headers)
 
     assert response.status_code == 200
-    assert set(response.json()) == {ATTACKER_FILE, SHARED_FILE}
-    assert VICTIM_FILE not in response.json()
-    assert AGENT_FILE not in response.json()
+    assert set(response.json) == {ATTACKER_FILE, SHARED_FILE}
+    assert VICTIM_FILE not in response.json
+    assert AGENT_FILE not in response.json
 
 
 def test_query_multiple_no_longer_returns_foreign_files(attacker_headers):
@@ -188,7 +182,7 @@ def test_query_multiple_no_longer_returns_foreign_files(attacker_headers):
     )
 
     assert response.status_code == 200
-    contents = [entry[0]["page_content"] for entry in response.json()]
+    contents = [entry[0]["page_content"] for entry in response.json]
     assert contents == ["attacker note"]
 
 
@@ -208,7 +202,7 @@ def test_query_authorizes_every_hit_not_just_the_first(attacker_headers):
     )
 
     assert response.status_code == 200
-    contents = [entry[0]["page_content"] for entry in response.json()]
+    contents = [entry[0]["page_content"] for entry in response.json]
     assert contents == ["attacker own row"]
 
 
@@ -222,7 +216,7 @@ def test_query_without_entity_id_cannot_reach_another_owner(attacker_headers):
     )
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json == []
 
 
 def test_entity_id_is_still_caller_asserted(attacker_headers):
@@ -250,7 +244,7 @@ def test_entity_id_is_still_caller_asserted(attacker_headers):
     )
 
     assert response.status_code == 200
-    contents = [entry[0]["page_content"] for entry in response.json()]
+    contents = [entry[0]["page_content"] for entry in response.json]
     assert contents == ["victim secret"], (
         "entity_id reach changed — if a token now proves entity authorization, "
         "this test should assert refusal instead"
@@ -273,14 +267,14 @@ def test_query_reaches_an_agent_knowledge_base(attacker_headers):
     )
 
     assert response.status_code == 200
-    contents = [entry[0]["page_content"] for entry in response.json()]
+    contents = [entry[0]["page_content"] for entry in response.json]
     assert contents == ["agent knowledge"]
 
 
 def test_documents_route_refuses_a_foreign_file(attacker_headers):
     """``GET /documents`` returned the chunks of any file id the caller named."""
     response = client.get(
-        "/documents", params={"ids": [VICTIM_FILE]}, headers=attacker_headers
+        "/documents", query_string={"ids": [VICTIM_FILE]}, headers=attacker_headers
     )
 
     assert response.status_code == 404
@@ -296,9 +290,7 @@ def test_document_context_refuses_a_foreign_file(attacker_headers):
 def test_delete_cannot_remove_a_foreign_file(attacker_headers, store_double):
     """``DELETE /documents`` deleted by file id alone, so any authenticated
     caller could destroy another owner's chunks by naming one."""
-    response = client.request(
-        "DELETE", "/documents", json=[VICTIM_FILE], headers=attacker_headers
-    )
+    response = client.delete("/documents", json=[VICTIM_FILE], headers=attacker_headers)
 
     assert response.status_code == 404
     assert store_double == []
@@ -314,10 +306,9 @@ def test_delete_accepts_entity_id_as_a_query_parameter(attacker_headers, store_d
     send; a delete that only accepted it in the body would silently drop it and
     orphan every agent knowledge-base file.
     """
-    response = client.request(
-        "DELETE",
+    response = client.delete(
         "/documents",
-        params={"entity_id": AGENT},
+        query_string={"entity_id": AGENT},
         json=[AGENT_FILE],
         headers=attacker_headers,
     )
@@ -335,9 +326,7 @@ def test_delete_without_entity_id_leaves_entity_owned_chunks(
     do, and the 404 it gets is indistinguishable from "already deleted" — so the
     orphan is silent unless the caller names the entity.
     """
-    response = client.request(
-        "DELETE", "/documents", json=[AGENT_FILE], headers=attacker_headers
-    )
+    response = client.delete("/documents", json=[AGENT_FILE], headers=attacker_headers)
 
     assert response.status_code == 404
     assert store_double == []
@@ -354,8 +343,7 @@ def test_partial_delete_destroys_nothing_before_reporting_not_found(
     reads — silently loses data it never asked to delete. Reported against the
     first version of this route and re-pinned here.
     """
-    response = client.request(
-        "DELETE",
+    response = client.delete(
         "/documents",
         json=[ATTACKER_FILE, "file-does-not-exist"],
         headers=attacker_headers,
@@ -368,14 +356,12 @@ def test_partial_delete_destroys_nothing_before_reporting_not_found(
 def test_owner_still_reads_and_deletes_their_own(victim_headers, store_double):
     """The scope must not lock owners out of their own content."""
     read = client.get(
-        "/documents", params={"ids": [VICTIM_FILE]}, headers=victim_headers
+        "/documents", query_string={"ids": [VICTIM_FILE]}, headers=victim_headers
     )
     assert read.status_code == 200
-    assert read.json()[0]["page_content"] == "victim secret"
+    assert read.json[0]["page_content"] == "victim secret"
 
-    removed = client.request(
-        "DELETE", "/documents", json=[VICTIM_FILE], headers=victim_headers
-    )
+    removed = client.delete("/documents", json=[VICTIM_FILE], headers=victim_headers)
     assert removed.status_code == 200
     assert store_double == [VICTIM_FILE]
 
@@ -398,11 +384,11 @@ def test_unauthenticated_deployment_keeps_reading_its_own_chunks(monkeypatch):
         )
 
         assert response.status_code == 200
-        contents = [entry[0]["page_content"] for entry in response.json()]
+        contents = [entry[0]["page_content"] for entry in response.json]
         assert contents == ["public row"]
 
         listed = client.get("/ids")
         assert listed.status_code == 200
-        assert listed.json() == [public_file]
+        assert listed.json == [public_file]
     finally:
         ROWS.pop()

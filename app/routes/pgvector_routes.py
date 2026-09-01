@@ -1,8 +1,12 @@
 # app/routes/pgvector_routes.py
-from fastapi import APIRouter, HTTPException
-from app.services.database import PSQLDatabase
+from flask import Blueprint, jsonify
 
-router = APIRouter()
+from app.async_runner import async_route
+from app.errors import APIError
+from app.services.database import PSQLDatabase
+from app.validation import query_param, required_query_param, required_query_params
+
+bp = Blueprint("pgvector", __name__)
 
 
 async def check_index_exists(table_name: str, column_name: str) -> bool:
@@ -23,16 +27,27 @@ async def check_index_exists(table_name: str, column_name: str) -> bool:
     return result[0]['exists']
 
 
-@router.get("/test/check_index")
-async def check_file_id_index(table_name: str, column_name: str):
+@bp.get("/test/check_index")
+@async_route
+async def check_file_id_index():
+    table_name, column_name = required_query_params("table_name", "column_name")
     if await check_index_exists(table_name, column_name):
-        return {"message": f"Index on {column_name} exists in the table {table_name}."}
+        return jsonify({"message": f"Index on {column_name} exists in the table {table_name}."})
     else:
-        return HTTPException(status_code=404, detail=f"No index on {column_name} found in the table {table_name}.")
+        # Always answered 200 with the error object as the body (debug route).
+        return jsonify(
+            {
+                "status_code": 404,
+                "detail": f"No index on {column_name} found in the table {table_name}.",
+                "headers": None,
+            }
+        )
 
 
-@router.get("/db/tables")
-async def get_table_names(schema: str = "public"):
+@bp.get("/db/tables")
+@async_route
+async def get_table_names():
+    schema = query_param("schema", "public")
     pool = await PSQLDatabase.get_pool()
     async with pool.acquire() as conn:
         table_names = await conn.fetch(
@@ -45,11 +60,14 @@ async def get_table_names(schema: str = "public"):
         )
     # Extract table names from records
     tables = [record['table_name'] for record in table_names]
-    return {"schema": schema, "tables": tables}
+    return jsonify({"schema": schema, "tables": tables})
 
 
-@router.get("/db/tables/columns")
-async def get_table_columns(table_name: str, schema: str = "public"):
+@bp.get("/db/tables/columns")
+@async_route
+async def get_table_columns():
+    table_name = required_query_param("table_name")
+    schema = query_param("schema", "public")
     pool = await PSQLDatabase.get_pool()
     async with pool.acquire() as conn:
         columns = await conn.fetch(
@@ -62,14 +80,16 @@ async def get_table_columns(table_name: str, schema: str = "public"):
             schema, table_name,
         )
     column_names = [col['column_name'] for col in columns]
-    return {"table_name": table_name, "columns": column_names}
+    return jsonify({"table_name": table_name, "columns": column_names})
 
 
-@router.get("/records/all")
-async def get_all_records(table_name: str):
+@bp.get("/records/all")
+@async_route
+async def get_all_records():
+    table_name = required_query_param("table_name")
     # Validate that the table name is one of the expected ones to prevent SQL injection
     if table_name not in ["langchain_pg_collection", "langchain_pg_embedding"]:
-        raise HTTPException(status_code=400, detail="Invalid table name")
+        raise APIError(status_code=400, detail="Invalid table name")
 
     pool = await PSQLDatabase.get_pool()
     async with pool.acquire() as conn:
@@ -79,14 +99,17 @@ async def get_all_records(table_name: str):
     # Convert records to JSON serializable format, assuming records can be directly serialized
     records_json = [dict(record) for record in records]
 
-    return records_json
+    return jsonify(records_json)
 
 
-@router.get("/records")
-async def get_records_filtered_by_custom_id(custom_id: str, table_name: str = "langchain_pg_embedding"):
+@bp.get("/records")
+@async_route
+async def get_records_filtered_by_custom_id():
+    custom_id = required_query_param("custom_id")
+    table_name = query_param("table_name", "langchain_pg_embedding")
     # Validate that the table name is one of the expected ones to prevent SQL injection
     if table_name not in ["langchain_pg_collection", "langchain_pg_embedding"]:
-        raise HTTPException(status_code=400, detail="Invalid table name")
+        raise APIError(status_code=400, detail="Invalid table name")
 
     pool = await PSQLDatabase.get_pool()
     async with pool.acquire() as conn:
@@ -97,4 +120,4 @@ async def get_records_filtered_by_custom_id(custom_id: str, table_name: str = "l
     # Convert records to JSON serializable format, assuming the Record class has a dict method.
     records_json = [dict(record) for record in records]
 
-    return records_json
+    return jsonify(records_json)

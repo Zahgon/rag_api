@@ -2,12 +2,14 @@
   "version": "0.2.0",
   "configurations": [
       {
-          "name": "Debug FastAPI",
+          "name": "Debug Flask",
           "type": "python",
           "request": "launch",
-          "module": "uvicorn",
+          "module": "flask",
           "args": [
+              "--app",
               "main:app",
+              "run",
               "--port",
               "8000",
               "--reload"

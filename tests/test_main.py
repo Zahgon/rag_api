@@ -2,14 +2,22 @@ import os
 import jwt
 import datetime
 import pytest
-from fastapi.testclient import TestClient
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor
 
 from main import app
 from app.routes import document_routes
 
-client = TestClient(app)
+client = app.test_client()
+
+
+def _auth_header():
+    jwt_secret = os.environ.setdefault("JWT_SECRET", "testsecret")
+    payload = {
+        "id": "testuser",
+        "exp": datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(hours=1),
+    }
+    return {"Authorization": f"Bearer {jwt.encode(payload, jwt_secret, algorithm='HS256')}"}
 
 
 @pytest.fixture
@@ -40,12 +48,6 @@ def override_vector_store(monkeypatch):
     monkeypatch.setattr(
         document_routes, "get_cached_query_embedding", dummy_get_cached_query_embedding
     )
-
-    # Initialize thread pool for tests since TestClient doesn't run lifespan
-    if not hasattr(app.state, "thread_pool") or app.state.thread_pool is None:
-        app.state.thread_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="test-worker"
-        )
 
     # Override get_all_ids as an async function - patch at CLASS level to bypass run_in_executor
     async def dummy_get_all_ids(self, owners=None, executor=None):
@@ -136,28 +138,26 @@ def override_vector_store(monkeypatch):
 def test_get_all_ids(auth_headers):
     response = client.get("/ids", headers=auth_headers)
     assert response.status_code == 200
-    json_data = response.json()
+    json_data = response.json
     assert isinstance(json_data, list)
     assert "testid1" in json_data
 
 
 def test_get_documents_by_ids(auth_headers):
     response = client.get(
-        "/documents", params={"ids": ["testid1"]}, headers=auth_headers
+        "/documents", query_string={"ids": ["testid1"]}, headers=auth_headers
     )
     assert response.status_code == 200
-    json_data = response.json()
+    json_data = response.json
     assert isinstance(json_data, list)
     assert json_data[0]["page_content"] == "Test content"
     assert json_data[0]["metadata"]["file_id"] == "testid1"
 
 
 def test_delete_documents(auth_headers):
-    response = client.request(
-        "DELETE", "/documents", json=["testid1"], headers=auth_headers
-    )
+    response = client.delete("/documents", json=["testid1"], headers=auth_headers)
     assert response.status_code == 200
-    json_data = response.json()
+    json_data = response.json
     assert "Documents for" in json_data["message"]
 
 
@@ -170,7 +170,7 @@ def test_query_embeddings_by_file_id(auth_headers):
     }
     response = client.post("/query", json=data, headers=auth_headers)
     assert response.status_code == 200
-    json_data = response.json()
+    json_data = response.json
     assert isinstance(json_data, list)
     if json_data:
         doc = json_data[0][0]
@@ -192,8 +192,8 @@ def test_embed_local_file(tmp_path, auth_headers, monkeypatch):
         "file_id": "testid1",
     }
     response = client.post("/local/embed", json=data, headers=auth_headers)
-    assert response.status_code == 200, f"Response: {response.text}"
-    json_data = response.json()
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    json_data = response.json
     assert json_data["status"] is True
     assert json_data["file_id"] == "testid1"
 
@@ -205,20 +205,24 @@ def test_embed_file(tmp_path, auth_headers):
     with test_file.open("rb") as f:
         response = client.post(
             "/embed",
-            data={"file_id": "testid1", "entity_id": "testuser"},
-            files={"file": ("test_embed.txt", f, "text/plain")},
+            data={
+                "file_id": "testid1",
+                "entity_id": "testuser",
+                "file": (f, "test_embed.txt", "text/plain"),
+            },
+            content_type="multipart/form-data",
             headers=auth_headers,
         )
-    assert response.status_code == 200, f"Response: {response.text}"
-    json_data = response.json()
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    json_data = response.json
     assert json_data["status"] is True
     assert json_data["file_id"] == "testid1"
 
 
 def test_load_document_context(auth_headers):
     response = client.get("/documents/testid1/context", headers=auth_headers)
-    assert response.status_code == 200, f"Response: {response.text}"
-    content = response.text
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    content = response.get_data(as_text=True)
     assert "testid1" in content or "Test content" in content
 
 
@@ -257,8 +261,8 @@ def test_load_document_context_restores_parallel_chunk_order(auth_headers, monke
 
     response = client.get("/documents/testid1/context", headers=auth_headers)
 
-    assert response.status_code == 200, f"Response: {response.text}"
-    assert response.json() == "firstsecondthird"
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    assert response.json == "firstsecondthird"
 
 
 def test_load_document_context_groups_repeated_ingestion_attempts(
@@ -288,8 +292,8 @@ def test_load_document_context_groups_repeated_ingestion_attempts(
 
     response = client.get("/documents/testid1/context", headers=auth_headers)
 
-    assert response.status_code == 200, f"Response: {response.text}"
-    assert response.json() == "old-firstold-secondnew-firstnew-second"
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    assert response.json == "old-firstold-secondnew-firstnew-second"
 
 
 def test_embed_file_upload(tmp_path, auth_headers, monkeypatch):
@@ -300,12 +304,16 @@ def test_embed_file_upload(tmp_path, auth_headers, monkeypatch):
     with test_file.open("rb") as f:
         response = client.post(
             "/embed-upload",
-            data={"file_id": "testid1", "entity_id": "testuser"},
-            files={"uploaded_file": ("upload_test.txt", f, "text/plain")},
+            data={
+                "file_id": "testid1",
+                "entity_id": "testuser",
+                "uploaded_file": (f, "upload_test.txt", "text/plain"),
+            },
+            content_type="multipart/form-data",
             headers=auth_headers,
         )
-    assert response.status_code == 200, f"Response: {response.text}"
-    json_data = response.json()
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    json_data = response.json
     assert json_data["status"] is True
     assert json_data["file_id"] == "testid1"
 
@@ -317,8 +325,8 @@ def test_query_multiple(auth_headers):
         "k": 4,
     }
     response = client.post("/query_multiple", json=data, headers=auth_headers)
-    assert response.status_code == 200, f"Response: {response.text}"
-    json_data = response.json()
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    json_data = response.json
     assert isinstance(json_data, list)
     if json_data:
         doc = json_data[0][0]
@@ -334,13 +342,17 @@ def test_extract_text_from_file(tmp_path, auth_headers):
     with test_file.open("rb") as f:
         response = client.post(
             "/text",
-            data={"file_id": "test_text_123", "entity_id": "testuser"},
-            files={"file": ("test_text_extraction.txt", f, "text/plain")},
+            data={
+                "file_id": "test_text_123",
+                "entity_id": "testuser",
+                "file": (f, "test_text_extraction.txt", "text/plain"),
+            },
+            content_type="multipart/form-data",
             headers=auth_headers,
         )
 
-    assert response.status_code == 200, f"Response: {response.text}"
-    json_data = response.json()
+    assert response.status_code == 200, f"Response: {response.get_data(as_text=True)}"
+    json_data = response.json
 
     # Check response structure
     assert "text" in json_data
@@ -353,3 +365,175 @@ def test_extract_text_from_file(tmp_path, auth_headers):
     assert json_data["file_id"] == "test_text_123"
     assert json_data["filename"] == "test_text_extraction.txt"
     assert json_data["known_type"] is True  # text files are known types
+
+
+# ---------------------------------------------------------------------------
+# Wire contract of the previous framework: validation envelopes, body parsing,
+# routing and middleware order, compared byte-for-byte against the original.
+# ---------------------------------------------------------------------------
+
+
+def test_query_malformed_json_reports_json_invalid(auth_headers):
+    response = client.post(
+        "/query", data="{", content_type="application/json", headers=auth_headers
+    )
+    assert response.status_code == 422
+    assert response.json == {
+        "detail": [
+            {
+                "type": "json_invalid",
+                "loc": ["body", 1],
+                "msg": "JSON decode error",
+                "input": {},
+                "ctx": {"error": "Expecting property name enclosed in double quotes"},
+            }
+        ],
+        "message": "Request validation failed",
+    }
+
+
+def test_query_body_that_is_not_an_object(auth_headers):
+    response = client.post(
+        "/query", data="[]", content_type="application/json", headers=auth_headers
+    )
+    assert response.status_code == 422
+    assert response.json["detail"] == [
+        {
+            "type": "model_attributes_type",
+            "loc": ["body"],
+            "msg": "Input should be a valid dictionary or object to extract fields from",
+            "input": [],
+        }
+    ]
+
+
+def test_query_body_without_content_type_is_read_as_json(auth_headers):
+    response = client.post(
+        "/query",
+        data=b'{"query": "Test query", "file_id": "testid1"}',
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert response.json[0][0]["page_content"] == "Queried content"
+
+
+def test_query_body_not_declared_as_json_is_not_parsed(auth_headers):
+    response = client.post(
+        "/query",
+        data=b'{"query": "Test query", "file_id": "testid1"}',
+        content_type="text/plain",
+        headers=auth_headers,
+    )
+    # the body is never read as JSON, and the raw body in the validation error is
+    # what it always was: not renderable, so the request ends as a plain-text 500
+    assert response.status_code == 500
+    assert response.content_type.startswith("text/plain")
+
+
+def test_embed_reports_every_missing_multipart_field(auth_headers):
+    response = client.post("/embed", headers=auth_headers)
+    assert response.status_code == 422
+    assert response.json["detail"] == [
+        {"type": "missing", "loc": ["body", "file_id"], "msg": "Field required", "input": None},
+        {"type": "missing", "loc": ["body", "file"], "msg": "Field required", "input": None},
+    ]
+
+
+def test_trailing_slash_redirects_to_the_route(auth_headers):
+    response = client.get("/ids/?entity_id=x", headers=auth_headers)
+    assert response.status_code == 307
+    assert response.headers["Location"] == "http://localhost/ids?entity_id=x"
+
+
+def test_unknown_route_is_json(auth_headers):
+    response = client.get("/nope", headers=auth_headers)
+    assert response.status_code == 404
+    assert response.json == {"detail": "Not Found"}
+
+
+def test_rejected_request_carries_no_cors_headers():
+    os.environ["JWT_SECRET"] = "testsecret"
+    response = client.get("/ids", headers={"Origin": "http://example.com"})
+    assert response.status_code == 401
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+    preflight = client.options(
+        "/ids",
+        headers={"Origin": "http://example.com", "Access-Control-Request-Method": "GET"},
+    )
+    assert preflight.status_code == 401
+    assert "Access-Control-Allow-Origin" not in preflight.headers
+
+
+def test_authorised_request_carries_cors_headers(auth_headers):
+    response = client.get("/ids", headers={**auth_headers, "Origin": "http://example.com"})
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+
+
+def test_request_with_cookies_is_answered_with_its_own_origin(auth_headers):
+    client.set_cookie("session", "x", domain="localhost")
+    try:
+        response = client.get(
+            "/ids", headers={**auth_headers, "Origin": "http://example.com"}
+        )
+    finally:
+        client.delete_cookie("session", domain="localhost")
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "http://example.com"
+    assert "Origin" in response.headers["Vary"]
+
+
+def test_cors_preflight_is_answered_directly(auth_headers):
+    response = client.options(
+        "/ids",
+        headers={
+            **auth_headers,
+            "Origin": "http://example.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_data(as_text=True) == "OK"
+    assert response.headers["Access-Control-Allow-Origin"] == "http://example.com"
+    assert response.headers["Access-Control-Allow-Methods"] == (
+        "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+    )
+    assert response.headers["Access-Control-Allow-Headers"] == "authorization"
+    assert response.headers["Access-Control-Max-Age"] == "600"
+
+
+def test_openapi_schema_is_served_without_authentication():
+    os.environ["JWT_SECRET"] = "testsecret"
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    assert response.content_type == "application/json"
+    schema = response.json
+    assert schema["openapi"] == "3.1.0"
+    assert schema["info"] == {"title": "FastAPI", "version": "0.1.0"}
+    assert "/query" in schema["paths"]
+
+
+def test_docs_pages_are_served():
+    os.environ["JWT_SECRET"] = "testsecret"
+    docs = client.get("/docs")
+    assert docs.status_code == 200
+    assert docs.content_type.startswith("text/html")
+    assert "swagger-ui" in docs.get_data(as_text=True)
+
+    # /redoc was never exempt from authentication
+    assert client.get("/redoc").status_code == 401
+    assert client.get("/redoc", headers=_auth_header()).status_code == 200
+
+
+def test_health_reports_a_failing_check_as_before(monkeypatch):
+    async def unhealthy():
+        return False
+
+    monkeypatch.setattr(document_routes, "is_health_ok", unhealthy)
+    response = client.get("/health")
+    # the (body, status) pair is sent as a two-element array with status 200
+    assert response.status_code == 200
+    assert response.json == [{"status": "DOWN"}, 503]

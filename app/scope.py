@@ -14,7 +14,7 @@ store returned.
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import Request
+from flask import g, has_app_context
 
 PUBLIC_OWNER = "public"
 
@@ -52,7 +52,7 @@ def files_clause(file_ids: Sequence[str]) -> Dict[str, Any]:
     return {"file_id": {"$in": list(file_ids)}}
 
 
-def resolve_scope(request: Request, entity_id: Optional[str] = None) -> ScopeFilter:
+def resolve_scope(entity_id: Optional[str] = None) -> ScopeFilter:
     """Resolve the owners this request may read.
 
     The caller's own identity always comes from the verified token — never from
@@ -65,7 +65,7 @@ def resolve_scope(request: Request, entity_id: Optional[str] = None) -> ScopeFil
     untrusted callers must still authorize entity access upstream. See
     ``README.md``.
     """
-    user = getattr(request.state, "user", None)
+    user = g.get("user") if has_app_context() else None
 
     if user is None:
         # No signing key configured anywhere: preserve the unauthenticated

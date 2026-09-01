@@ -10,7 +10,7 @@ services:
     ports:
       - "5433:5432"
 
-  fastapi:
+  flask:
     build: .
     environment:
       - DB_HOST=db

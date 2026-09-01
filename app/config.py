@@ -7,7 +7,7 @@ import urllib.parse
 from enum import Enum
 from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
-from starlette.middleware.base import BaseHTTPMiddleware
+from flask import request
 
 from app.services.vector_store.factory import get_vector_store
 
@@ -175,27 +175,30 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-class LogMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
+def log_request(response):
+    """Log one request/response pair.
 
-        logger_method = logger.info
+    Registered with ``Flask.after_request``, so it sees the response of every
+    request the application answers.
+    """
+    logger_method = logger.info
 
-        if str(request.url).endswith("/health"):
-            logger_method = logger.debug
+    if str(request.url).endswith("/health"):
+        logger_method = logger.debug
 
-        logger_method(
-            f"Request {request.method} {request.url} - {response.status_code}",
-            extra={
-                HTTP_REQ: {"method": request.method, "url": str(request.url)},
-                HTTP_RES: {"status_code": response.status_code},
-            },
-        )
+    logger_method(
+        f"Request {request.method} {request.url} - {response.status_code}",
+        extra={
+            HTTP_REQ: {"method": request.method, "url": str(request.url)},
+            HTTP_RES: {"status_code": response.status_code},
+        },
+    )
 
-        return response
+    return response
 
 
-logging.getLogger("uvicorn.access").disabled = True
+# The WSGI server's own access log would duplicate log_request above.
+logging.getLogger("werkzeug").disabled = True
 
 ## Credentials
 

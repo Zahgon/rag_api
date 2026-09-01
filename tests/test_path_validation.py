@@ -217,18 +217,16 @@ class TestValidateFilePathValidInputs:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests: endpoint-level path traversal via TestClient
+# Integration tests: endpoint-level path traversal via the Flask test client
 # ---------------------------------------------------------------------------
 
 import datetime
 import jwt
-from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock
-from concurrent.futures import ThreadPoolExecutor
 
 from main import app
 
-client = TestClient(app)
+client = app.test_client()
 
 
 @pytest.fixture
@@ -242,15 +240,6 @@ def auth_headers():
     }
     token = jwt.encode(payload, jwt_secret, algorithm="HS256")
     return {"Authorization": f"Bearer {token}"}
-
-
-@pytest.fixture(autouse=True)
-def _setup_thread_pool():
-    """Ensure app.state.thread_pool exists for tests."""
-    if not hasattr(app.state, "thread_pool") or app.state.thread_pool is None:
-        app.state.thread_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="test-worker"
-        )
 
 
 class TestLocalEmbedPathTraversal:
@@ -276,7 +265,7 @@ class TestLocalEmbedPathTraversal:
         # Should get 404 (file not found) or 400 (invalid) — NOT 200
         assert response.status_code in (400, 404), (
             f"Path traversal not blocked on /local/embed with filepath={filepath!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
 
 
@@ -297,13 +286,17 @@ class TestEntityIdPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed",
-                data={"file_id": "testid1", "entity_id": entity_id},
-                files={"file": ("safe.txt", f, "text/plain")},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": entity_id,
+                    "file": (f, "safe.txt", "text/plain"),
+                },
+                content_type="multipart/form-data",
                 headers=auth_headers,
             )
         assert response.status_code == 400, (
             f"entity_id traversal not blocked on /embed with entity_id={entity_id!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
 
     @pytest.mark.parametrize(
@@ -320,13 +313,17 @@ class TestEntityIdPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/text",
-                data={"file_id": "testid1", "entity_id": entity_id},
-                files={"file": ("safe.txt", f, "text/plain")},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": entity_id,
+                    "file": (f, "safe.txt", "text/plain"),
+                },
+                content_type="multipart/form-data",
                 headers=auth_headers,
             )
         assert response.status_code == 400, (
             f"entity_id traversal not blocked on /text with entity_id={entity_id!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
 
 
@@ -347,13 +344,17 @@ class TestEmbedPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed",
-                data={"file_id": "testid1", "entity_id": "testuser"},
-                files={"file": (filename, f, "text/plain")},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": "testuser",
+                    "file": (f, filename, "text/plain"),
+                },
+                content_type="multipart/form-data",
                 headers=auth_headers,
             )
         assert response.status_code == 400, (
             f"Path traversal not blocked on /embed with filename={filename!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
 
 
@@ -374,13 +375,17 @@ class TestEmbedUploadPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/embed-upload",
-                data={"file_id": "testid1", "entity_id": "testuser"},
-                files={"uploaded_file": (filename, f, "text/plain")},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": "testuser",
+                    "uploaded_file": (f, filename, "text/plain"),
+                },
+                content_type="multipart/form-data",
                 headers=auth_headers,
             )
         assert response.status_code == 400, (
             f"Path traversal not blocked on /embed-upload with filename={filename!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
 
 
@@ -401,11 +406,15 @@ class TestTextEndpointPathTraversal:
         with test_file.open("rb") as f:
             response = client.post(
                 "/text",
-                data={"file_id": "testid1", "entity_id": "testuser"},
-                files={"file": (filename, f, "text/plain")},
+                data={
+                    "file_id": "testid1",
+                    "entity_id": "testuser",
+                    "file": (f, filename, "text/plain"),
+                },
+                content_type="multipart/form-data",
                 headers=auth_headers,
             )
         assert response.status_code == 400, (
             f"Path traversal not blocked on /text with filename={filename!r}. "
-            f"Got status {response.status_code}: {response.text}"
+            f"Got status {response.status_code}: {response.get_data(as_text=True)}"
         )
